@@ -4,7 +4,6 @@ import json
 import os
 import random
 import string
-import traceback
 from typing import Tuple
 
 import plugins
@@ -12,8 +11,7 @@ from bridge.bridge import Bridge
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
 from common import const
-from common.log import logger
-from config import conf, load_config
+from config import conf, load_config, global_config
 from plugins import *
 
 # 定义指令集
@@ -32,6 +30,10 @@ COMMANDS = {
         "args": ["口令"],
         "desc": "管理员认证",
     },
+    "model": {
+        "alias": ["model", "模型"],
+        "desc": "查看和设置全局模型",
+    },
     "set_openai_api_key": {
         "alias": ["set_openai_api_key"],
         "args": ["api_key"],
@@ -40,6 +42,18 @@ COMMANDS = {
     "reset_openai_api_key": {
         "alias": ["reset_openai_api_key"],
         "desc": "重置为默认的api_key",
+    },
+    "set_gpt_model": {
+        "alias": ["set_gpt_model"],
+        "desc": "设置你的私有模型",
+    },
+    "reset_gpt_model": {
+        "alias": ["reset_gpt_model"],
+        "desc": "重置你的私有模型",
+    },
+    "gpt_model": {
+        "alias": ["gpt_model"],
+        "desc": "查询你使用的模型",
     },
     "id": {
         "alias": ["id", "用户"],
@@ -166,16 +180,13 @@ class Godcmd(Plugin):
     def __init__(self):
         super().__init__()
 
-        curdir = os.path.dirname(__file__)
-        config_path = os.path.join(curdir, "config.json")
-        gconf = None
-        if not os.path.exists(config_path):
-            gconf = {"password": "", "admin_users": []}
-            with open(config_path, "w") as f:
-                json.dump(gconf, f, indent=4)
-        else:
-            with open(config_path, "r") as f:
-                gconf = json.load(f)
+        config_path = os.path.join(os.path.dirname(__file__), "config.json")
+        gconf = super().load_config()
+        if not gconf:
+            if not os.path.exists(config_path):
+                gconf = {"password": "", "admin_users": []}
+                with open(config_path, "w") as f:
+                    json.dump(gconf, f, indent=4)
         if gconf["password"] == "":
             self.temp_password = "".join(random.sample(string.digits, 4))
             logger.info("[Godcmd] 因未设置口令，本次的临时口令为%s。" % self.temp_password)
@@ -248,6 +259,18 @@ class Godcmd(Plugin):
                                 break
                         if not ok:
                             result = "插件不存在或未启用"
+                elif cmd == "model":
+                    if not isadmin and not self.is_admin_in_group(e_context["context"]):
+                        ok, result = False, "需要管理员权限执行"
+                    elif len(args) == 0:
+                        ok, result = True, "当前模型为: " + str(conf().get("model"))
+                    elif len(args) == 1:
+                        if args[0] not in const.MODEL_LIST:
+                            ok, result = False, "模型名称不存在"
+                        else:
+                            conf()["model"] = args[0]
+                            Bridge().reset_bot()
+                            ok, result = True, "模型设置为: " + str(conf().get("model"))
                 elif cmd == "id":
                     ok, result = True, user
                 elif cmd == "set_openai_api_key":
@@ -264,8 +287,28 @@ class Godcmd(Plugin):
                         ok, result = True, "你的OpenAI私有api_key已清除"
                     except Exception as e:
                         ok, result = False, "你没有设置私有api_key"
+                elif cmd == "set_gpt_model":
+                    if len(args) == 1:
+                        user_data = conf().get_user_data(user)
+                        user_data["gpt_model"] = args[0]
+                        ok, result = True, "你的GPT模型已设置为" + args[0]
+                    else:
+                        ok, result = False, "请提供一个GPT模型"
+                elif cmd == "gpt_model":
+                    user_data = conf().get_user_data(user)
+                    model = conf().get("model")
+                    if "gpt_model" in user_data:
+                        model = user_data["gpt_model"]
+                    ok, result = True, "你的GPT模型为" + str(model)
+                elif cmd == "reset_gpt_model":
+                    try:
+                        user_data = conf().get_user_data(user)
+                        user_data.pop("gpt_model")
+                        ok, result = True, "你的GPT模型已重置"
+                    except Exception as e:
+                        ok, result = False, "你没有设置私有GPT模型"
                 elif cmd == "reset":
-                    if bottype in [const.OPEN_AI, const.CHATGPT, const.CHATGPTONAZURE]:
+                    if bottype in [const.OPEN_AI, const.CHATGPT, const.CHATGPTONAZURE, const.LINKAI, const.BAIDU, const.XUNFEI]:
                         bot.sessions.clear_session(session_id)
                         channel.cancel_session(session_id)
                         ok, result = True, "会话已重置"
@@ -288,7 +331,8 @@ class Godcmd(Plugin):
                             load_config()
                             ok, result = True, "配置已重载"
                         elif cmd == "resetall":
-                            if bottype in [const.OPEN_AI, const.CHATGPT, const.CHATGPTONAZURE]:
+                            if bottype in [const.OPEN_AI, const.CHATGPT, const.CHATGPTONAZURE, const.LINKAI,
+                                           const.BAIDU, const.XUNFEI]:
                                 channel.cancel_all_session()
                                 bot.sessions.clear_all_session()
                                 ok, result = True, "重置所有会话成功"
@@ -397,12 +441,20 @@ class Godcmd(Plugin):
         password = args[0]
         if password == self.password:
             self.admin_users.append(userid)
+            global_config["admin_users"].append(userid)
             return True, "认证成功"
         elif password == self.temp_password:
             self.admin_users.append(userid)
+            global_config["admin_users"].append(userid)
             return True, "认证成功，请尽快设置口令"
         else:
             return False, "认证失败"
 
     def get_help_text(self, isadmin=False, isgroup=False, **kwargs):
         return get_help_text(isadmin, isgroup)
+
+
+    def is_admin_in_group(self, context):
+        if context["isgroup"]:
+            return context.kwargs.get("msg").actual_user_id in global_config["admin_users"]
+        return False
